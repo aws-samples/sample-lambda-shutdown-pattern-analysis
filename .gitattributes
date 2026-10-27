@@ -1,0 +1,13 @@
+# Force LF line endings on files that are exec'd via a shebang on Linux (Lambda).
+# Windows CRLF on these makes the kernel read "#!/bin/bash\r" and fail to spawn
+# the extension process (Extension.LaunchError: ProcessSpawnFailed).
+
+# The external extension launcher (runs as /opt/extensions/<name>)
+extension/extensions/nodejs-example-telemetry-api-extension text eol=lf
+
+# The extension entrypoint (exec'd via "#!/usr/bin/env node")
+extension/nodejs-example-telemetry-api-extension/index.js text eol=lf
+
+# Shell scripts and the custom runtime bootstrap must be LF as well
+*.sh text eol=lf
+test/bootstrap text eol=lf

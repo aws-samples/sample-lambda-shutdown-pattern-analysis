@@ -1,0 +1,17 @@
+# Build artifacts
+.build/
+.aws-sam/
+extension/extension.zip
+
+# Node dependencies (installed at build time)
+node_modules/
+
+# Local test / invoke outputs
+*-response.json
+response.json
+
+# Editor / tooling
+.kiro/
+# Local security scan (ASH) config and output; contains internal URLs
+.ash/
+ash-scan-output-*/

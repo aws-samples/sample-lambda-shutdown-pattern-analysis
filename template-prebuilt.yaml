@@ -1,0 +1,286 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Lambda Shutdown Pattern Analysis - Unified Deployment (Windows compatible)
+  Run build-layer.ps1 (Windows) or build-layer.sh (Linux/Mac) before sam build.
+
+Parameters:
+  MetricsLogGroup:
+    Type: String
+    Default: /metrics/lambda-execution-lifecycle
+    Description: Dedicated CloudWatch log group for EMF metrics
+  CorrelationWindowMs:
+    Type: String
+    Default: '30000'
+    Description: Time window in ms to correlate cold starts after shutdowns
+  LookbackHours:
+    Type: String
+    Default: '24'
+    Description: How many hours of data the correlation Lambda analyzes per run
+  CorrelationSchedule:
+    Type: String
+    Default: rate(1 hour)
+    Description: How often to run the cold start correlation analysis
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+    Description: >
+      Bedrock inference profile ID (or model ID) for AI recommendations. Must be an
+      ACTIVE model that you have enabled in your Region. Models go "Legacy" over time;
+      if deployment-time analysis fails with a ResourceNotFoundException about a legacy
+      model, set this to a current one (see DEPLOYMENT.md).
+  PrebuiltLayerArn:
+    Type: String
+    Default: ''
+    Description: >
+      Optional. ARN of a telemetry extension layer version already published via
+      'aws lambda publish-layer-version' (which preserves the Unix executable bit).
+      Leave empty to have SAM build the layer from .build/telemetry-extension-layer.zip
+      (note: on Windows, SAM's upload re-zips and strips the +x bit, causing
+      Extension.LaunchError: ProcessSpawnFailed at run time - supply this ARN instead).
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 5
+
+Conditions:
+  BuildLayerInStack: !Equals [!Ref PrebuiltLayerArn, '']
+
+Resources:
+  # ---- Extension Layer (built by SAM only when PrebuiltLayerArn is NOT provided) ----
+  TelemetryExtensionLayer:
+    Type: AWS::Serverless::LayerVersion
+    Condition: BuildLayerInStack
+    Properties:
+      LayerName: shutdown-pattern-telemetry-extension
+      ContentUri: .build/telemetry-extension-layer.zip
+      CompatibleRuntimes:
+        - nodejs22.x
+      LicenseInfo: MIT-0
+      RetentionPolicy: Delete
+
+  # ---- Metrics Log Group ----
+  MetricsLogGroupResource:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref MetricsLogGroup
+      RetentionInDays: 14
+
+  # ---- Sample Function with Extension ----
+  SampleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-sample-function
+      CodeUri: sample-function/hello-world/
+      Handler: app.lambdaHandler
+      MemorySize: 256
+      Architectures:
+        - x86_64
+      Layers:
+        - !If [BuildLayerInStack, !Ref TelemetryExtensionLayer, !Ref PrebuiltLayerArn]
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MetricsLogGroup}:*
+      Environment:
+        Variables:
+          METRICS_LOG_GROUP: !Ref MetricsLogGroup
+      Events:
+        # The /hello endpoint is intentionally public and unauthenticated so the
+        # sample can be driven with a plain HTTP request during the workshop/demo.
+        # It returns a static greeting and exposes no sensitive data or back-end
+        # access. Add an authorizer before using a pattern like this in production.
+        HelloApi:
+          Type: Api
+          Properties:
+            Path: /hello
+            Method: get
+
+  # ---- Cold Start Correlation Lambda ----
+  ColdStartCorrelationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-correlation
+      CodeUri: insights/cold-start-correlation/
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 120
+      Environment:
+        Variables:
+          LOG_GROUP_NAME: !Ref MetricsLogGroup
+          CORRELATION_WINDOW_MS: !Ref CorrelationWindowMs
+          LOOKBACK_HOURS: !Ref LookbackHours
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:StartQuery
+                - logs:GetQueryResults
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MetricsLogGroup}:*
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MetricsLogGroup}:*
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: lambda-execution-lifecycle
+      Events:
+        ScheduledAnalysis:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref CorrelationSchedule
+            Description: Periodic cold start correlation analysis
+            Enabled: true
+
+  # ---- Metrics Extraction Lambda ----
+  ExtractMetricsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-extract-metrics
+      CodeUri: insights/recommendation-engine/
+      Handler: extract-metrics.handler
+      MemorySize: 256
+      Timeout: 300
+      Environment:
+        Variables:
+          LOG_GROUP_NAME: !Ref MetricsLogGroup
+          CORRELATION_FUNCTION_NAME: !Ref ColdStartCorrelationFunction
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:StartQuery
+                - logs:GetQueryResults
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MetricsLogGroup}:*
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt ColdStartCorrelationFunction.Arn
+
+  # ---- AI Recommendation Lambda ----
+  GenerateRecommendationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-generate-recommendations
+      CodeUri: insights/recommendation-engine/
+      Handler: generate-recommendations.handler
+      MemorySize: 256
+      Timeout: 120
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            # BedrockModelId is typically a CROSS-REGION inference profile (e.g.
+            # "us.anthropic.claude-sonnet-4-6"). When invoked, Bedrock routes the request
+            # to one of the profile's member Regions (for a "us." profile: us-east-1,
+            # us-east-2, us-west-2), so InvokeModel must be allowed on the foundation-model
+            # ARNs in ALL those Regions plus the inference-profile ARN itself. Scoping to a
+            # single Region breaks cross-Region inference with an AccessDeniedException.
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - arn:aws:bedrock:*::foundation-model/*
+                - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+
+  # ---- Dashboard Update Lambda ----
+  UpdateDashboardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-update-dashboard
+      CodeUri: insights/recommendation-engine/
+      Handler: update-dashboard.handler
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          DASHBOARD_NAME: Lambda-Shutdown-Pattern-Analysis
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:GetDashboard
+                - cloudwatch:PutDashboard
+              # Scoped to the single Overview dashboard this function updates.
+              # Dashboard ARNs have no Region (note the double colon).
+              Resource: !Sub arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/Lambda-Shutdown-Pattern-Analysis
+
+  # ---- Step Functions Recommendation Pipeline ----
+  RecommendationPipeline:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: shutdown-pattern-recommendation-pipeline
+      DefinitionUri: insights/recommendation-engine/state-machine.asl.json
+      DefinitionSubstitutions:
+        ExtractMetricsFunctionArn: !GetAtt ExtractMetricsFunction.Arn
+        GenerateRecommendationsFunctionArn: !GetAtt GenerateRecommendationsFunction.Arn
+        UpdateDashboardFunctionArn: !GetAtt UpdateDashboardFunction.Arn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                - !GetAtt ExtractMetricsFunction.Arn
+                - !GetAtt GenerateRecommendationsFunction.Arn
+                - !GetAtt UpdateDashboardFunction.Arn
+
+  # ---- CloudWatch Dashboard: Overview ----
+  ShutdownPatternDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: Lambda-Shutdown-Pattern-Analysis
+      DashboardBody:
+        Fn::Sub: "{\"widgets\":[{\"type\":\"text\",\"x\":0,\"y\":0,\"width\":12,\"height\":12,\"properties\":{\"markdown\":\"## AI Recommendations\\n\\nThe recommendation pipeline writes its Amazon Bedrock analysis here after it runs. To (re)generate it for a time window, start the recommendation Step Functions pipeline with a JSON input containing startTime and endTime as epoch seconds. The pipeline will:\\n\\n1. Extract shutdown metrics for the time range\\n2. Run cold-start correlation analysis\\n3. Generate recommendations via Bedrock\\n4. Update this widget\\n\",\"background\":\"solid\"}},{\"type\":\"text\",\"x\":12,\"y\":0,\"width\":12,\"height\":12,\"properties\":{\"markdown\":\"## How to read this dashboard\\n\\nAll widgets query the dedicated metrics log group and cover the **time range selected at the top right**. Set it to cover your load test.\\n\\n**Summary (top row)** - headline counts for the window:\\n\\n| Metric | Meaning |\\n|---|---|\\n| Environments Created | New execution environments started (each is a cold start) = records where `Environment` is present |\\n| Shutdowns | Environments the platform recycled = records where `Shutdowns` is present |\\n| Total Invocations | Requests served across all environments = records where `Invokes` is present |\\n| Avg Cold Start Overhead | Mean of `ColdStartOverhead` (init duration + gap to first invoke), in ms, per environment |\\n\\n**Shutdown Patterns table** - one row per lifetime band. Band is set by each environment's `TotalLifetime`:\\n\\n- **Fast** = lifetime < 4 min\\n- **Medium** = 4-10 min\\n- **Slow** = > 10 min\\n\\nColumns: Environments (count in band), Avg Lifetime, Avg Invocations, Avg Duration (billed ms/invoke), Avg Idle Gap (between invokes), Avg Shutdown Lapse (idle time before shutdown), Avg Traffic Drop (% decline before shutdown), Avg Memory Used.\\n\\n**Charts** - Shutdown Speed (share of Fast/Medium/Slow), Idle Gap Distribution (spacing between invokes; <5s = scaling, >30s = idle recycling), Traffic Drop vs Shutdown (does demand decline precede shutdown).\\n\\n[>> Deep Dive Dashboard](https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Lambda-Shutdown-Deep-Dive)\\n\",\"background\":\"solid\"}},{\"type\":\"log\",\"x\":0,\"y\":12,\"width\":24,\"height\":3,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | stats sum(if(ispresent(Environment), 1, 0)) as `Environments Created`, sum(if(ispresent(Shutdowns), 1, 0)) as `Shutdowns Observed`, sum(if(ispresent(Invokes), 1, 0)) as `Total Invocations`, avg(ColdStartOverhead) as `Avg Cold Start Overhead (ms)`\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"table\",\"title\":\"Summary (selected time range)\"}},{\"type\":\"log\",\"x\":0,\"y\":15,\"width\":24,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Shutdowns) | fields TotalLifetime / 1000 / 60 as lifetimeMin | fields if(lifetimeMin < 4, 'Fast (<4m)', if(lifetimeMin < 10, 'Medium (4-10m)', 'Slow (>10m)')) as Category | filter ispresent(Category) | stats count(*) as `Environments`, avg(TotalLifetime) / 1000 / 60 as `Avg Lifetime (min)`, avg(TotalInvokes) as `Avg Invocations`, avg(AvgBilledDuration) as `Avg Duration (ms)`, avg(AvgIdleGap) / 1000 as `Avg Idle Gap (s)`, avg(ShutdownLapse) / 1000 as `Avg Shutdown Lapse (s)`, avg(TrafficDropRate) as `Avg Traffic Drop (%)`, avg(AvgMemoryUtilizationPct) as `Avg Memory Used (%)` by Category\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"table\",\"title\":\"Shutdown Patterns Grouped by Environment Lifetime\"}},{\"type\":\"log\",\"x\":0,\"y\":21,\"width\":8,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Shutdowns) | fields TotalLifetime / 1000 / 60 as lifetimeMin | fields if(lifetimeMin < 4, 'Fast (<4m)', if(lifetimeMin < 10, 'Medium (4-10m)', 'Slow (>10m)')) as ShutdownSpeed | filter ispresent(ShutdownSpeed) | stats count(*) as envCount by ShutdownSpeed\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"pie\",\"title\":\"Shutdown Speed Distribution\"}},{\"type\":\"log\",\"x\":8,\"y\":21,\"width\":8,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Invokes) and IdleGap >= 0 | fields IdleGap / 1000 as idleGapSec | fields if(idleGapSec < 5, 'lt5s', if(idleGapSec < 15, '5-15s', if(idleGapSec < 30, '15-30s', if(idleGapSec < 60, '30-60s', '60s+')))) as IdleGapBucket | stats count(*) as occurrences by IdleGapBucket\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"bar\",\"title\":\"Idle Gap Distribution\"}},{\"type\":\"log\",\"x\":16,\"y\":21,\"width\":8,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Shutdowns) | fields if(TrafficDropRate < 25, 'Low (<25%)', if(TrafficDropRate < 50, 'Moderate (25-50%)', if(TrafficDropRate < 75, 'High (50-75%)', 'Severe (>75%)'))) as TrafficDrop | stats count(*) as `Environments`, avg(TotalLifetime) / 1000 / 60 as `Avg Lifetime (min)` by TrafficDrop\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"bar\",\"title\":\"Traffic Drop vs Shutdown\"}}]}"
+
+  # ---- CloudWatch Dashboard: Deep Dive ----
+  ShutdownPatternDeepDiveDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: Lambda-Shutdown-Deep-Dive
+      DashboardBody:
+        Fn::Sub: "{\"widgets\":[{\"type\":\"text\",\"x\":0,\"y\":0,\"width\":24,\"height\":2,\"properties\":{\"markdown\":\"## Deep Dive Metrics\\n\\n[<< Back to Overview Dashboard](https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Lambda-Shutdown-Pattern-Analysis)\\n\",\"background\":\"solid\"}},{\"type\":\"log\",\"x\":0,\"y\":2,\"width\":12,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Shutdowns) | fields ShutdownLapse / 1000 as shutdownLapseSec | stats avg(shutdownLapseSec) as AvgShutdownLapseSec, percentile(shutdownLapseSec, 50) as P50, percentile(shutdownLapseSec, 90) as P90 by bin(1h)\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"timeSeries\",\"title\":\"Shutdown Lapse Trend\"}},{\"type\":\"log\",\"x\":12,\"y\":2,\"width\":12,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Environment) | stats count(*) as ColdStarts by bin(5m)\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"timeSeries\",\"title\":\"Cold Start Rate Over Time\"}},{\"type\":\"log\",\"x\":0,\"y\":8,\"width\":12,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Invokes) | stats count(*) as InvocationsPerMin by bin(1m)\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"timeSeries\",\"title\":\"Invocation Rate Trend\"}},{\"type\":\"log\",\"x\":12,\"y\":8,\"width\":12,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Shutdowns) | stats count(*) as EnvCount, avg(TotalLifetime) / 1000 / 60 as AvgLifetimeMin, avg(TotalInvokes) as AvgInvokes by case( TrafficDropRate < 25, '1. Low (<25%)', TrafficDropRate >= 25 and TrafficDropRate < 50, '2. Moderate (25-50%)', TrafficDropRate >= 50 and TrafficDropRate < 75, '3. High (50-75%)', TrafficDropRate >= 75, '4. Severe (>75%)' ) as TrafficDrop\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"bar\",\"title\":\"Traffic Drop Rate vs Avg Lifetime\"}},{\"type\":\"log\",\"x\":0,\"y\":14,\"width\":12,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Invokes) and MemoryUtilizationPct > 0 | stats avg(MemoryUtilizationPct) as AvgMemUtil, max(MemoryUtilizationPct) as MaxMemUtil, percentile(MemoryUtilizationPct, 90) as P90MemUtil by bin(5m)\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"timeSeries\",\"title\":\"Memory Utilization Per Invocation\"}},{\"type\":\"log\",\"x\":12,\"y\":14,\"width\":12,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Invokes) and BilledDuration > 0 | stats avg(BilledDuration) as AvgDuration, percentile(BilledDuration, 50) as P50, percentile(BilledDuration, 90) as P90, percentile(BilledDuration, 99) as P99 by bin(5m)\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"timeSeries\",\"title\":\"Billed Duration Per Invocation\"}},{\"type\":\"log\",\"x\":0,\"y\":20,\"width\":12,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Invokes) and IdleGap >= 0 | fields IdleGap / 1000 as idleGapSec | stats count(*) as occurrences by case( idleGapSec < 1, '1. < 1s', idleGapSec >= 1 and idleGapSec < 5, '2. 1-5s', idleGapSec >= 5 and idleGapSec < 15, '3. 5-15s', idleGapSec >= 15 and idleGapSec < 30, '4. 15-30s', idleGapSec >= 30 and idleGapSec < 60, '5. 30-60s', idleGapSec >= 60 and idleGapSec < 120, '6. 1-2 min', idleGapSec >= 120, '7. 2+ min' ) as IdleGapBucket\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"bar\",\"title\":\"Idle Gap Distribution (Detailed)\"}},{\"type\":\"log\",\"x\":12,\"y\":20,\"width\":12,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Invokes) and IdleGap >= 0 | stats avg(IdleGap) / 1000 as AvgIdleGapSec, percentile(IdleGap / 1000, 50) as P50Sec, percentile(IdleGap / 1000, 90) as P90Sec by bin(5m)\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"timeSeries\",\"title\":\"Idle Gap Trend Over Time\"}},{\"type\":\"log\",\"x\":0,\"y\":26,\"width\":8,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Shutdowns) | stats count(*) as totalShutdowns, sum(IsColdStart) as totalColdStarts, avg(ColdStartOverhead) as avgColdStartOverheadMs, sum(ColdStartOverhead) / 1000 as totalColdStartOverheadSec, avg(AllocatedMemory) as avgMemoryMB, avg(TotalInvokes) as avgInvokesPerEnv, avg(TotalLifetime) / 1000 / 60 as avgLifetimeMin\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"table\",\"title\":\"Cold Start Cost Impact Summary\"}},{\"type\":\"log\",\"x\":8,\"y\":26,\"width\":8,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Shutdowns) | stats max(PeakRequestsPerMinute) as overallPeakRPM, avg(PeakRequestsPerMinute) as avgPeakRPM, percentile(PeakRequestsPerMinute, 90) as p90PeakRPM, avg(AvgBilledDuration) as avgDurationMs, avg(InvokeRate) as avgInvokeRate, count(*) as totalEnvironments, avg(AllocatedMemory) as memoryMB\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"table\",\"title\":\"Provisioned Concurrency Sizing Data\"}},{\"type\":\"log\",\"x\":16,\"y\":26,\"width\":8,\"height\":6,\"properties\":{\"query\":\"SOURCE '${MetricsLogGroup}' | filter ispresent(Shutdowns) and ShutdownReason = 'SPINDOWN' | stats count(*) as spindownCount, avg(AvgIdleGap) / 1000 as avgIdleGapSec, percentile(AvgIdleGap / 1000, 50) as p50IdleGapSec, percentile(AvgIdleGap / 1000, 90) as p90IdleGapSec, avg(ShutdownLapse) / 1000 as avgShutdownLapseSec, percentile(ShutdownLapse / 1000, 10) as p10ShutdownLapseSec, percentile(ShutdownLapse / 1000, 50) as p50ShutdownLapseSec\",\"region\":\"${AWS::Region}\",\"stacked\":false,\"view\":\"table\",\"title\":\"Keep-Alive Interval Estimation\"}}]}"
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL for load testing
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Stage/hello"
+  SampleFunctionArn:
+    Description: Sample Lambda Function ARN
+    Value: !GetAtt SampleFunction.Arn
+  ExtensionLayerArn:
+    Description: Telemetry Extension Layer ARN
+    Value: !If [BuildLayerInStack, !Ref TelemetryExtensionLayer, !Ref PrebuiltLayerArn]
+  CorrelationFunctionArn:
+    Description: Cold Start Correlation Lambda ARN
+    Value: !GetAtt ColdStartCorrelationFunction.Arn
+  RecommendationPipelineArn:
+    Description: Step Functions recommendation pipeline ARN
+    Value: !Ref RecommendationPipeline
+  DashboardUrl:
+    Description: CloudWatch Overview Dashboard URL
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Lambda-Shutdown-Pattern-Analysis"
+  DeepDiveDashboardUrl:
+    Description: CloudWatch Deep Dive Dashboard URL
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Lambda-Shutdown-Deep-Dive"
+  MetricsLogGroupName:
+    Description: Dedicated metrics log group
+    Value: !Ref MetricsLogGroup

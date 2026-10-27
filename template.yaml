@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Lambda Shutdown Pattern Analysis - Unified Deployment
+  Deploys the telemetry extension layer, sample function, correlation Lambda,
+  and CloudWatch dashboard in a single stack.
+
+Parameters:
+  MetricsLogGroup:
+    Type: String
+    Default: /metrics/lambda-execution-lifecycle
+    Description: Dedicated CloudWatch log group for EMF metrics (keeps Insights scan costs low)
+  CorrelationWindowMs:
+    Type: String
+    Default: '30000'
+    Description: Time window in ms to correlate cold starts after shutdowns
+  LookbackHours:
+    Type: String
+    Default: '24'
+    Description: How many hours of data the correlation Lambda analyzes per run
+  CorrelationSchedule:
+    Type: String
+    Default: rate(1 hour)
+    Description: How often to run the cold start correlation analysis
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 5
+
+Resources:
+  # ---- Extension Layer ----
+  TelemetryExtensionLayer:
+    Type: AWS::Serverless::LayerVersion
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      LayerName: shutdown-pattern-telemetry-extension
+      ContentUri: extension/
+      CompatibleRuntimes:
+        - nodejs22.x
+      LicenseInfo: MIT-0
+      RetentionPolicy: Delete
+
+  # ---- Metrics Log Group (explicit creation for retention control) ----
+  MetricsLogGroupResource:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref MetricsLogGroup
+      RetentionInDays: 14
+
+  # ---- Sample Function with Extension ----
+  SampleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-sample-function
+      CodeUri: sample-function/hello-world/
+      Handler: app.lambdaHandler
+      MemorySize: 256
+      Architectures:
+        - x86_64
+      Layers:
+        - !Ref TelemetryExtensionLayer
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MetricsLogGroup}:*
+      Environment:
+        Variables:
+          METRICS_LOG_GROUP: !Ref MetricsLogGroup
+      Events:
+        HelloApi:
+          Type: Api
+          Properties:
+            Path: /hello
+            Method: get
+
+  # ---- Cold Start Correlation Lambda ----
+  ColdStartCorrelationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-correlation
+      CodeUri: insights/cold-start-correlation/
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 120
+      Environment:
+        Variables:
+          LOG_GROUP_NAME: !Ref MetricsLogGroup
+          CORRELATION_WINDOW_MS: !Ref CorrelationWindowMs
+          LOOKBACK_HOURS: !Ref LookbackHours
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:StartQuery
+                - logs:GetQueryResults
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MetricsLogGroup}:*
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MetricsLogGroup}:*
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: lambda-execution-lifecycle
+      Events:
+        ScheduledAnalysis:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref CorrelationSchedule
+            Description: Periodic cold start correlation analysis
+            Enabled: true
+
+  # ---- CloudWatch Dashboard ----
+  ShutdownPatternDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: Lambda-Shutdown-Pattern-Analysis
+      DashboardBody:
+        Fn::Sub: |
+          {
+            "widgets": [
+              {
+                "type": "log", "x": 0, "y": 0, "width": 8, "height": 6,
+                "properties": {
+                  "query": "filter Environment = 1 | stats count(*) as ColdStarts by bin(1h)",
+                  "region": "${AWS::Region}", "stacked": false, "view": "bar",
+                  "title": "Cold Starts Per Hour",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 8, "y": 0, "width": 8, "height": 6,
+                "properties": {
+                  "query": "filter Shutdowns = 1 | stats count(*) as ShutdownCount by bin(1h)",
+                  "region": "${AWS::Region}", "stacked": false, "view": "bar",
+                  "title": "Shutdowns Per Hour",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 16, "y": 0, "width": 8, "height": 6,
+                "properties": {
+                  "query": "filter Invokes = 1 | stats count(*) as Invocations by bin(1h)",
+                  "region": "${AWS::Region}", "stacked": false, "view": "bar",
+                  "title": "Invocations Per Hour",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 0, "y": 6, "width": 6, "height": 6,
+                "properties": {
+                  "query": "filter Shutdowns = 1 | stats count(*) as envCount by case( TotalLifetime < 180000, 'Fast (< 3 min)', TotalLifetime >= 180000 and TotalLifetime < 600000, 'Medium (3-10 min)', TotalLifetime >= 600000, 'Slow (> 10 min)' ) as ShutdownSpeed",
+                  "region": "${AWS::Region}", "stacked": false, "view": "pie",
+                  "title": "Shutdown Speed Distribution",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 6, "y": 6, "width": 6, "height": 6,
+                "properties": {
+                  "query": "filter Shutdowns = 1 | stats count(*) as envCount by @properties.ShutdownReason as ShutdownReason",
+                  "region": "${AWS::Region}", "stacked": false, "view": "pie",
+                  "title": "Shutdown Reasons",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 12, "y": 6, "width": 12, "height": 6,
+                "properties": {
+                  "query": "filter Shutdowns = 1 | fields TotalLifetime / 1000 / 60 as lifetimeMinutes | stats count(*) as envCount by case( lifetimeMinutes < 1, '00-01 min', lifetimeMinutes >= 1 and lifetimeMinutes < 2, '01-02 min', lifetimeMinutes >= 2 and lifetimeMinutes < 3, '02-03 min', lifetimeMinutes >= 3 and lifetimeMinutes < 5, '03-05 min', lifetimeMinutes >= 5 and lifetimeMinutes < 10, '05-10 min', lifetimeMinutes >= 10 and lifetimeMinutes < 15, '10-15 min', lifetimeMinutes >= 15, '15+ min' ) as LifetimeBucket",
+                  "region": "${AWS::Region}", "stacked": false, "view": "bar",
+                  "title": "Environment Lifetime Distribution",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 0, "y": 12, "width": 12, "height": 6,
+                "properties": {
+                  "query": "filter Shutdowns = 1 | fields ShutdownLapse / 1000 as shutdownLapseSec | stats avg(shutdownLapseSec) as AvgShutdownLapseSec, percentile(shutdownLapseSec, 50) as P50, percentile(shutdownLapseSec, 90) as P90 by bin(1h)",
+                  "region": "${AWS::Region}", "stacked": false, "view": "timeSeries",
+                  "title": "Shutdown Lapse Trend",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 12, "y": 12, "width": 12, "height": 6,
+                "properties": {
+                  "query": "filter Environment = 1 | stats count(*) as ColdStarts by bin(5m)",
+                  "region": "${AWS::Region}", "stacked": false, "view": "timeSeries",
+                  "title": "Cold Start Rate Over Time",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 0, "y": 18, "width": 12, "height": 6,
+                "properties": {
+                  "query": "filter Invokes = 1 | stats count(*) as InvocationsPerMin by bin(1m)",
+                  "region": "${AWS::Region}", "stacked": false, "view": "timeSeries",
+                  "title": "Invocation Rate Trend",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 12, "y": 18, "width": 12, "height": 6,
+                "properties": {
+                  "query": "filter Shutdowns = 1 | stats count(*) as EnvCount, avg(TotalLifetime) / 1000 / 60 as AvgLifetimeMin, avg(TotalInvokes) as AvgInvokes by case( TrafficDropRate < 25, '1. Low (<25%)', TrafficDropRate >= 25 and TrafficDropRate < 50, '2. Moderate (25-50%)', TrafficDropRate >= 50 and TrafficDropRate < 75, '3. High (50-75%)', TrafficDropRate >= 75, '4. Severe (>75%)' ) as TrafficDrop",
+                  "region": "${AWS::Region}", "stacked": false, "view": "bar",
+                  "title": "Traffic Drop Rate vs Avg Lifetime",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 0, "y": 24, "width": 12, "height": 6,
+                "properties": {
+                  "query": "filter Invokes = 1 and MemoryUtilizationPct > 0 | stats avg(MemoryUtilizationPct) as AvgMemUtil, max(MemoryUtilizationPct) as MaxMemUtil, percentile(MemoryUtilizationPct, 90) as P90MemUtil by bin(5m)",
+                  "region": "${AWS::Region}", "stacked": false, "view": "timeSeries",
+                  "title": "Memory Utilization Per Invocation",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 12, "y": 24, "width": 12, "height": 6,
+                "properties": {
+                  "query": "filter Invokes = 1 and BilledDuration > 0 | stats avg(BilledDuration) as AvgDuration, percentile(BilledDuration, 50) as P50, percentile(BilledDuration, 90) as P90, percentile(BilledDuration, 99) as P99 by bin(5m)",
+                  "region": "${AWS::Region}", "stacked": false, "view": "timeSeries",
+                  "title": "Billed Duration Per Invocation",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 0, "y": 30, "width": 12, "height": 6,
+                "properties": {
+                  "query": "filter Invokes = 1 and IdleGap >= 0 | fields IdleGap / 1000 as idleGapSec | stats count(*) as occurrences by case( idleGapSec < 1, '1. < 1s', idleGapSec >= 1 and idleGapSec < 5, '2. 1-5s', idleGapSec >= 5 and idleGapSec < 15, '3. 5-15s', idleGapSec >= 15 and idleGapSec < 30, '4. 15-30s', idleGapSec >= 30 and idleGapSec < 60, '5. 30-60s', idleGapSec >= 60 and idleGapSec < 120, '6. 1-2 min', idleGapSec >= 120, '7. 2+ min' ) as IdleGapBucket",
+                  "region": "${AWS::Region}", "stacked": false, "view": "bar",
+                  "title": "Idle Gap Distribution",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 12, "y": 30, "width": 12, "height": 6,
+                "properties": {
+                  "query": "filter Invokes = 1 and IdleGap >= 0 | stats avg(IdleGap) / 1000 as AvgIdleGapSec, percentile(IdleGap / 1000, 50) as P50Sec, percentile(IdleGap / 1000, 90) as P90Sec by bin(5m)",
+                  "region": "${AWS::Region}", "stacked": false, "view": "timeSeries",
+                  "title": "Idle Gap Trend Over Time",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 0, "y": 36, "width": 8, "height": 6,
+                "properties": {
+                  "query": "filter Shutdowns = 1 | stats count(*) as totalShutdowns, sum(IsColdStart) as totalColdStarts, avg(ColdStartOverhead) as avgColdStartOverheadMs, sum(ColdStartOverhead) / 1000 as totalColdStartOverheadSec, avg(AllocatedMemory) as avgMemoryMB, avg(TotalInvokes) as avgInvokesPerEnv, avg(TotalLifetime) / 1000 / 60 as avgLifetimeMin",
+                  "region": "${AWS::Region}", "stacked": false, "view": "table",
+                  "title": "Cold Start Cost Impact Summary",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 8, "y": 36, "width": 8, "height": 6,
+                "properties": {
+                  "query": "filter Shutdowns = 1 | stats max(PeakRequestsPerMinute) as overallPeakRPM, avg(PeakRequestsPerMinute) as avgPeakRPM, percentile(PeakRequestsPerMinute, 90) as p90PeakRPM, avg(AvgBilledDuration) as avgDurationMs, avg(InvokeRate) as avgInvokeRate, count(*) as totalEnvironments, avg(AllocatedMemory) as memoryMB",
+                  "region": "${AWS::Region}", "stacked": false, "view": "table",
+                  "title": "Provisioned Concurrency Sizing Data",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              },
+              {
+                "type": "log", "x": 16, "y": 36, "width": 8, "height": 6,
+                "properties": {
+                  "query": "filter Shutdowns = 1 and @properties.ShutdownReason = 'SPINDOWN' | stats count(*) as spindownCount, avg(AvgIdleGap) / 1000 as avgIdleGapSec, percentile(AvgIdleGap / 1000, 50) as p50IdleGapSec, percentile(AvgIdleGap / 1000, 90) as p90IdleGapSec, avg(ShutdownLapse) / 1000 as avgShutdownLapseSec, percentile(ShutdownLapse / 1000, 10) as p10ShutdownLapseSec, percentile(ShutdownLapse / 1000, 50) as p50ShutdownLapseSec",
+                  "region": "${AWS::Region}", "stacked": false, "view": "table",
+                  "title": "Keep-Alive Interval Estimation",
+                  "log_group_names": ["${MetricsLogGroup}"]
+                }
+              }
+            ]
+          }
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL for load testing
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Stage/hello"
+  SampleFunctionArn:
+    Description: Sample Lambda Function ARN
+    Value: !GetAtt SampleFunction.Arn
+  ExtensionLayerArn:
+    Description: Telemetry Extension Layer ARN (use this to attach to your own functions)
+    Value: !Ref TelemetryExtensionLayer
+  CorrelationFunctionArn:
+    Description: Cold Start Correlation Lambda ARN
+    Value: !GetAtt ColdStartCorrelationFunction.Arn
+  DashboardUrl:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Lambda-Shutdown-Pattern-Analysis"
+  MetricsLogGroupName:
+    Description: Dedicated metrics log group (use this for Insights queries)
+    Value: !Ref MetricsLogGroup

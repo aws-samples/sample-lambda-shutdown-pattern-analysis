@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Lambda Shutdown Pattern Analysis - Correlation and AI Recommendation Engine
+
+Parameters:
+  LogGroupName:
+    Type: String
+    Default: /metrics/lambda-execution-lifecycle
+  CorrelationWindowMs:
+    Type: String
+    Default: '30000'
+  LookbackHours:
+    Type: String
+    Default: '24'
+  CorrelationSchedule:
+    Type: String
+    Default: rate(1 hour)
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+  DashboardName:
+    Type: String
+    Default: Lambda-Shutdown-Pattern-Analysis
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 120
+    MemorySize: 256
+
+Resources:
+  # ---- Cold Start Correlation Lambda ----
+  ColdStartCorrelationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-correlation
+      CodeUri: cold-start-correlation/
+      Handler: index.handler
+      Environment:
+        Variables:
+          LOG_GROUP_NAME: !Ref LogGroupName
+          CORRELATION_WINDOW_MS: !Ref CorrelationWindowMs
+          LOOKBACK_HOURS: !Ref LookbackHours
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:StartQuery
+                - logs:GetQueryResults
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}:*
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}:*
+      Events:
+        ScheduledAnalysis:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref CorrelationSchedule
+            Enabled: true
+
+  # ---- Metrics Extraction Lambda ----
+  ExtractMetricsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-extract-metrics
+      CodeUri: recommendation-engine/
+      Handler: extract-metrics.handler
+      Timeout: 300
+      Environment:
+        Variables:
+          LOG_GROUP_NAME: !Ref LogGroupName
+          CORRELATION_FUNCTION_NAME: !Ref ColdStartCorrelationFunction
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:StartQuery
+                - logs:GetQueryResults
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}:*
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt ColdStartCorrelationFunction.Arn
+
+  # ---- AI Recommendation Lambda ----
+  GenerateRecommendationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-generate-recommendations
+      CodeUri: recommendation-engine/
+      Handler: generate-recommendations.handler
+      Timeout: 120
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            # BedrockModelId is typically a cross-Region inference profile; invoking it
+            # routes to the profile's member Regions, so allow InvokeModel on the
+            # foundation-model ARNs in all Regions plus the inference-profile ARN.
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - arn:aws:bedrock:*::foundation-model/*
+                - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+
+  # ---- Dashboard Update Lambda ----
+  UpdateDashboardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: shutdown-pattern-update-dashboard
+      CodeUri: recommendation-engine/
+      Handler: update-dashboard.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          DASHBOARD_NAME: !Ref DashboardName
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:GetDashboard
+                - cloudwatch:PutDashboard
+              # Scoped to the single dashboard this function updates.
+              # Dashboard ARNs have no Region (note the double colon).
+              Resource: !Sub arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/${DashboardName}
+
+  # ---- Step Functions State Machine ----
+  RecommendationPipeline:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: shutdown-pattern-recommendation-pipeline
+      DefinitionUri: recommendation-engine/state-machine.asl.json
+      DefinitionSubstitutions:
+        ExtractMetricsFunctionArn: !GetAtt ExtractMetricsFunction.Arn
+        GenerateRecommendationsFunctionArn: !GetAtt GenerateRecommendationsFunction.Arn
+        UpdateDashboardFunctionArn: !GetAtt UpdateDashboardFunction.Arn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                - !GetAtt ExtractMetricsFunction.Arn
+                - !GetAtt GenerateRecommendationsFunction.Arn
+                - !GetAtt UpdateDashboardFunction.Arn
+
+Outputs:
+  RecommendationPipelineArn:
+    Description: Step Functions state machine ARN for the recommendation pipeline
+    Value: !Ref RecommendationPipeline
+  ExtractMetricsFunctionArn:
+    Description: Metrics extraction Lambda ARN
+    Value: !GetAtt ExtractMetricsFunction.Arn
+  GenerateRecommendationsFunctionArn:
+    Description: AI recommendation Lambda ARN
+    Value: !GetAtt GenerateRecommendationsFunction.Arn

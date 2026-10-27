@@ -1,0 +1,51 @@
+{
+  "Comment": "Lambda Shutdown Pattern Analysis - Recommendation Pipeline",
+  "StartAt": "ExtractMetrics",
+  "States": {
+    "ExtractMetrics": {
+      "Type": "Task",
+      "Resource": "${ExtractMetricsFunctionArn}",
+      "Parameters": {
+        "startTime.$": "$.startTime",
+        "endTime.$": "$.endTime"
+      },
+      "ResultPath": "$.metricsResult",
+      "Next": "GenerateRecommendations",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2
+        }
+      ]
+    },
+    "GenerateRecommendations": {
+      "Type": "Task",
+      "Resource": "${GenerateRecommendationsFunctionArn}",
+      "Parameters": {
+        "metricsData.$": "$.metricsResult",
+        "correlationData.$": "$.metricsResult.coldStartCorrelation"
+      },
+      "ResultPath": "$.recommendationResult",
+      "Next": "UpdateDashboard",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2
+        }
+      ]
+    },
+    "UpdateDashboard": {
+      "Type": "Task",
+      "Resource": "${UpdateDashboardFunctionArn}",
+      "Parameters": {
+        "recommendations.$": "$.recommendationResult.recommendations",
+        "analysisWindow.$": "$.recommendationResult.analysisWindow",
+        "generatedAt.$": "$.recommendationResult.generatedAt"
+      },
+      "ResultPath": "$.dashboardResult",
+      "End": true
+    }
+  }
+}

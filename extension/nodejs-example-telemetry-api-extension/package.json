@@ -1,0 +1,9 @@
+{
+  "name": "nodejs-example-telemetry-api-extension",
+  "version": "0.0.1",
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch-logs": "^3.0.0"
+  }
+}

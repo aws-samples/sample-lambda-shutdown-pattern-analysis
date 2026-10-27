@@ -1,0 +1,10 @@
+{
+  "name": "cold-start-correlation",
+  "version": "1.0.0",
+  "description": "Correlates cold starts with shutdowns to identify environment churn",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch-logs": "^3.0.0",
+    "aws-embedded-metrics": "^4.2.0"
+  }
+}

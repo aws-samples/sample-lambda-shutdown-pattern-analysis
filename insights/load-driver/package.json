@@ -1,0 +1,6 @@
+{
+  "name": "shutdown-pattern-load-driver",
+  "version": "1.0.0",
+  "description": "Server-side load generator that drives one burst of traffic against the sample API per invocation.",
+  "main": "index.js"
+}
