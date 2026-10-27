@@ -1,0 +1,17 @@
+version = 0.1
+
+[default.build.parameters]
+template_file = "template-prebuilt.yaml"
+
+[default.deploy.parameters]
+template_file = "template-prebuilt.yaml"
+stack_name = "shutdown-pattern-analysis"
+resolve_s3 = true
+s3_prefix = "shutdown-pattern-analysis"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "MetricsLogGroup=\"/metrics/lambda-execution-lifecycle\" CorrelationWindowMs=\"30000\" LookbackHours=\"24\" CorrelationSchedule=\"rate(1 hour)\" BedrockModelId=\"us.anthropic.claude-sonnet-4-6\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

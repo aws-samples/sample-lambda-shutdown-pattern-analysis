@@ -1,0 +1,59 @@
+{
+  "description": "CloudWatch Insights queries for AI recommendation engine. Each query produces structured data that feeds into the recommendation pipeline JSON format.",
+  "logGroupPlaceholder": "/metrics/lambda-execution-lifecycle",
+  "queries": {
+    "1_shutdown_speed_distribution": {
+      "description": "Categorizes shutdowns into fast (<3min), medium (3-10min), slow (>10min) buckets with key metrics per bucket. Answers: What does the lifecycle look like for environments that die quickly vs those that survive?",
+      "query": "filter Shutdowns = 1 | fields TotalLifetime / 1000 / 60 as lifetimeMinutes, TotalInvokes, AvgIdleGap, TrafficDropRate, AvgBilledDuration, ShutdownLapse, @properties.ShutdownReason as shutdownReason, @properties.ExtensionId as envId | fields if(TotalLifetime < 180000, 'fast_lt_3min', if(TotalLifetime < 600000, 'medium_3_10min', 'slow_gt_10min')) as shutdownSpeed | stats count(*) as shutdownCount, avg(lifetimeMinutes) as avgLifetimeMin, avg(TotalInvokes) as avgInvokes, avg(AvgIdleGap) as avgIdleGapMs, avg(TrafficDropRate) as avgTrafficDrop, avg(AvgBilledDuration) as avgBilledDurationMs, avg(ShutdownLapse) as avgShutdownLapseMs by shutdownSpeed"
+    },
+    "2_shutdown_by_reason": {
+      "description": "Breakdown of shutdown reasons with lifecycle characteristics. Answers: Are SPINDOWN shutdowns behaving differently from TIMEOUT or FAILURE?",
+      "query": "filter Shutdowns = 1 | fields @properties.ShutdownReason as shutdownReason, TotalLifetime, TotalInvokes, AvgIdleGap, TrafficDropRate, ColdStartOverhead, IsColdStart | stats count(*) as shutdownCount, avg(TotalLifetime) / 1000 / 60 as avgLifetimeMin, avg(TotalInvokes) as avgInvokes, avg(AvgIdleGap) / 1000 as avgIdleGapSec, avg(TrafficDropRate) as avgTrafficDrop, sum(IsColdStart) as coldStartCount by shutdownReason"
+    },
+    "3_invocation_count_vs_shutdown_speed": {
+      "description": "Distribution of invocation counts across shutdown speed categories. Answers: Do environments with fewer invocations shut down faster?",
+      "query": "filter Shutdowns = 1 | fields TotalInvokes, TotalLifetime, TotalLifetime / 1000 / 60 as lifetimeMinutes | fields if(TotalInvokes <= 5, '1_very_low_1_5', if(TotalInvokes <= 20, '2_low_6_20', if(TotalInvokes <= 50, '3_medium_21_50', '4_high_50_plus'))) as invokeCategory | stats count(*) as envCount, avg(TotalInvokes) as avgInvokes, min(TotalInvokes) as minInvokes, max(TotalInvokes) as maxInvokes, avg(lifetimeMinutes) as avgLifetimeMin by invokeCategory"
+    },
+    "4_traffic_pattern_vs_shutdown": {
+      "description": "How traffic drop rate correlates with shutdown speed. Answers: Do environments with steep traffic declines get shut down faster?",
+      "query": "filter Shutdowns = 1 | fields TrafficDropRate, TotalLifetime / 1000 / 60 as lifetimeMinutes, InvokesLastMinute, InvokesFirstMinute, PeakRequestsPerMinute, InvokeRate | fields if(TrafficDropRate < 25, '1_low_drop_lt_25pct', if(TrafficDropRate < 50, '2_moderate_drop_25_50pct', if(TrafficDropRate < 75, '3_high_drop_50_75pct', '4_severe_drop_gt_75pct'))) as trafficDropCategory | stats count(*) as envCount, avg(lifetimeMinutes) as avgLifetimeMin, avg(InvokesLastMinute) as avgLastMinInvokes, avg(PeakRequestsPerMinute) as avgPeakRPM, avg(InvokeRate) as avgInvokeRate by trafficDropCategory"
+    },
+    "5_memory_pressure_vs_shutdown": {
+      "description": "Memory utilization patterns across shutdown speed categories. Answers: Do high memory utilization environments behave differently at shutdown?",
+      "query": "filter Shutdowns = 1 | fields MaxMemoryUtilizationPct, AvgMemoryUtilizationPct, AllocatedMemory, TotalLifetime / 1000 / 60 as lifetimeMinutes, TotalInvokes | fields if(AvgMemoryUtilizationPct < 30, '1_low_lt_30pct', if(AvgMemoryUtilizationPct < 60, '2_medium_30_60pct', if(AvgMemoryUtilizationPct < 80, '3_high_60_80pct', '4_critical_gt_80pct'))) as memoryCategory | stats count(*) as envCount, avg(lifetimeMinutes) as avgLifetimeMin, avg(MaxMemoryUtilizationPct) as avgMaxMemUtil, avg(AvgMemoryUtilizationPct) as avgMemUtil, avg(TotalInvokes) as avgInvokes by memoryCategory"
+    },
+    "6_billed_duration_vs_shutdown": {
+      "description": "How execution duration patterns relate to shutdown behavior. Answers: Do environments running longer functions survive longer?",
+      "query": "filter Shutdowns = 1 | fields AvgBilledDuration, TotalBilledDuration, TotalLifetime / 1000 / 60 as lifetimeMinutes, TotalInvokes, ShutdownLapse / 1000 as shutdownLapseSec | fields if(AvgBilledDuration < 100, '1_fast_lt_100ms', if(AvgBilledDuration < 500, '2_medium_100_500ms', if(AvgBilledDuration < 1000, '3_slow_500ms_1s', '4_very_slow_gt_1s'))) as durationCategory | stats count(*) as envCount, avg(lifetimeMinutes) as avgLifetimeMin, avg(TotalInvokes) as avgInvokes, avg(shutdownLapseSec) as avgShutdownLapseSec by durationCategory"
+    },
+    "7a_shutdown_timeline": {
+      "description": "Lists all shutdown events with epoch timestamps, sorted by time. Use alongside 7b to correlate cold starts occurring within 30 seconds of a shutdown (cross-environment churn).",
+      "query": "filter Shutdowns = 1 | fields @timestamp, ShutdownEpoch, @properties.ExtensionId as envId, TotalLifetime, TotalInvokes, ShutdownLapse, @properties.ShutdownReason as reason | sort ShutdownEpoch asc"
+    },
+    "7b_cold_start_timeline": {
+      "description": "Lists all cold start events with epoch timestamps, sorted by time. Use alongside 7a to correlate cold starts occurring within 30 seconds of a shutdown.",
+      "query": "filter Environment = 1 | fields @timestamp, InitStartEpoch, @properties.ExtensionId as envId, @properties.MemoryConfig as memoryMB | sort InitStartEpoch asc"
+    },
+    "7c_cold_start_shutdown_hourly_summary": {
+      "description": "Hourly summary of cold starts and shutdowns for churn rate calculation. Compare totalColdStarts vs totalShutdowns per hour.",
+      "query_shutdowns": "filter Shutdowns = 1 | stats count(*) as totalShutdowns, avg(TotalLifetime) / 1000 / 60 as avgLifetimeMin, avg(ShutdownLapse) / 1000 as avgShutdownLapseSec by bin(1h)",
+      "query_cold_starts": "filter Environment = 1 | stats count(*) as totalColdStarts by bin(1h)"
+    },
+    "8_idle_gap_vs_shutdown": {
+      "description": "Idle gap patterns and their relationship to shutdown speed. Answers: Do environments with longer idle gaps between invocations shut down faster?",
+      "query": "filter Shutdowns = 1 | fields AvgIdleGap / 1000 as avgIdleGapSec, TotalIdleTime / 1000 as totalIdleSec, TotalLifetime / 1000 / 60 as lifetimeMinutes, TotalInvokes, ShutdownLapse / 1000 as shutdownLapseSec | fields if(AvgIdleGap < 5000, '1_tight_lt_5s', if(AvgIdleGap < 30000, '2_moderate_5_30s', if(AvgIdleGap < 120000, '3_sparse_30s_2min', '4_very_sparse_gt_2min'))) as idleGapCategory | stats count(*) as envCount, avg(lifetimeMinutes) as avgLifetimeMin, avg(totalIdleSec) as avgTotalIdleSec, avg(TotalInvokes) as avgInvokes, avg(shutdownLapseSec) as avgShutdownLapseSec by idleGapCategory"
+    },
+    "9_provisioned_concurrency_sizing": {
+      "description": "Data needed to calculate optimal provisioned concurrency count using Little's Law. Provides peak concurrent demand estimation.",
+      "query": "filter Shutdowns = 1 | fields PeakRequestsPerMinute, AvgBilledDuration, TotalInvokes, TotalLifetime, InvokeRate, @properties.MemoryConfig as memoryMB | stats max(PeakRequestsPerMinute) as overallPeakRPM, avg(PeakRequestsPerMinute) as avgPeakRPM, avg(AvgBilledDuration) as avgDurationMs, avg(InvokeRate) as avgInvokeRate, count(*) as totalEnvironments, sum(TotalInvokes) as totalInvocations, avg(TotalLifetime) / 1000 / 60 as avgLifetimeMin, max(@properties.MemoryConfig) as memoryConfigMB"
+    },
+    "10_keep_alive_interval_estimation": {
+      "description": "Data needed to determine optimal keep-alive ping interval. Focuses on idle gap patterns and shutdown lapse timing.",
+      "query": "filter Shutdowns = 1 and @properties.ShutdownReason = 'SPINDOWN' | fields AvgIdleGap / 1000 as avgIdleGapSec, ShutdownLapse / 1000 as shutdownLapseSec, TotalLifetime / 1000 / 60 as lifetimeMinutes, TotalInvokes, InvokeRate | stats count(*) as spindownCount, avg(avgIdleGapSec) as avgIdleGapSec, percentile(avgIdleGapSec, 50) as p50IdleGapSec, percentile(avgIdleGapSec, 90) as p90IdleGapSec, avg(shutdownLapseSec) as avgShutdownLapseSec, percentile(shutdownLapseSec, 50) as p50ShutdownLapseSec, percentile(shutdownLapseSec, 10) as p10ShutdownLapseSec, avg(lifetimeMinutes) as avgLifetimeMin"
+    },
+    "11_data_quality_check": {
+      "description": "Validates data completeness by checking missed platform.report events. High MissedReports indicates telemetry delivery issues.",
+      "query": "filter Shutdowns = 1 | fields ExtensionInvokes, TotalInvokes, MissedReports, TotalLifetime / 1000 / 60 as lifetimeMinutes | stats count(*) as totalEnvironments, sum(MissedReports) as totalMissedReports, avg(MissedReports) as avgMissedPerEnv, max(MissedReports) as maxMissedPerEnv, sum(ExtensionInvokes) as totalExtensionInvokes, sum(TotalInvokes) as totalTelemetryInvokes"
+    }
+  }
+}

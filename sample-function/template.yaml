@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sample function with Lambda shutdown pattern analysis extension
+
+Parameters:
+  ExtensionLayerArn:
+    Type: String
+    Description: ARN of the telemetry extension layer (deploy extension/template.yaml first)
+  MetricsLogGroup:
+    Type: String
+    Default: /metrics/lambda-execution-lifecycle
+    Description: Dedicated log group for EMF metrics
+
+Globals:
+  Function:
+    Timeout: 5
+
+Resources:
+  HelloWorldFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: hello-world/
+      Handler: app.lambdaHandler
+      Runtime: nodejs22.x
+      MemorySize: 256
+      Architectures:
+        - x86_64
+      Layers:
+        - !Ref ExtensionLayerArn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MetricsLogGroup}:*
+      Environment:
+        Variables:
+          METRICS_LOG_GROUP: !Ref MetricsLogGroup
+      Events:
+        HelloWorld:
+          Type: Api
+          Properties:
+            Path: /hello
+            Method: get
+
+Outputs:
+  HelloWorldApi:
+    Description: API Gateway endpoint URL for Stage
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Stage/hello/"
+  HelloWorldFunction:
+    Description: Hello World Lambda Function ARN
+    Value: !GetAtt HelloWorldFunction.Arn
