@@ -108,7 +108,7 @@ function permanently.
 ```
 extension/        Telemetry extension layer (the external extension + its Node.js code)
 sample-function/  Sample hello-world function the extension observes
-insights/         Correlation function, recommendation engine, load-driver, queries
+insights/         Correlation function, recommendation engine, queries
 test/             Load-test script
 template-prebuilt.yaml   Deploy template (prebuilt artifacts, no make required)
 deploy.ps1 / build-layer.* / build-layer-zip.mjs   Build + deploy helpers

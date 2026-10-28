@@ -4,9 +4,9 @@ This folder contains CloudWatch Insights queries and a correlation Lambda functi
 
 ## Cost Optimization: Dedicated Metrics Log Group
 
-All EMF metrics are directed to a dedicated log group (`/metrics/lambda-execution-lifecycle`) instead of the function's default log group. This means Insights queries only scan the small metrics-only log group, not the entire application log stream. This dramatically reduces Insights scan costs.
+All EMF metrics are directed to a dedicated log group (`/metrics/lambda-execution-lifecycle`) instead of the function's default log group. Because Insights queries scan only this dedicated metrics-only log group rather than the full application log stream, they read far less data per query.
 
-The extension sets this via `aws-embedded-metrics` `Configuration.logGroupName`, controlled by the `METRICS_LOG_GROUP` environment variable.
+The extension builds EMF records and writes them to the dedicated log group via the CloudWatch Logs `PutLogEvents` API. The destination is controlled by the `METRICS_LOG_GROUP` environment variable, defaulting to `/metrics/lambda-execution-lifecycle`.
 
 ## Structure
 

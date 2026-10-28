@@ -1,5 +1,17 @@
-# Custom AWS Lambda runtime
+# Load-test script
 
-A runtime is a program that runs a Lambda function's handler method when the function is invoked. The runtime can be included in your function's deployment package, or in a [layer](https://docs.aws.amazon.com/lambda/latest/dg/configuration-layers.html). [Learn more](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-custom.html) about custom Lambda runtimes.
+`test/hello.sh` drives the sample API through a realistic rise/fall/rise/idle traffic
+pattern — a scale-up burst, a reduced-load period, a second burst, and then a 15-minute
+idle wait. This produces the scale-up, idle periods, shutdowns, and cold starts the
+telemetry extension is built to observe. When given a pipeline ARN, the script then
+auto-triggers the recommendation analysis over the run's time window.
 
-For reference, this function includes a sample [Bash](https://www.gnu.org/software/bash/) runtime in `bootstrap.sample` and a corresponding handler file `hello.sh.sample`. As a next step, you should provide your own bootstrap by either adding a layer implementing a custom runtime or including a `bootstrap` file in this function's deployment package.
+## Usage
+
+```bash
+bash test/hello.sh <ApiEndpoint> <Region> <RecommendationPipelineArn>
+```
+
+The run takes about 30 minutes (traffic phases + a 15-minute idle wait + the analysis).
+The traffic is generated locally, so keep the machine awake or run it from AWS CloudShell.
+See the **Run the load test** section of the root [README.md](../README.md) for context.

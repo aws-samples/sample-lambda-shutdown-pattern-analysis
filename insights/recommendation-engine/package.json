@@ -4,7 +4,7 @@
   "description": "AI recommendation engine for Lambda shutdown pattern analysis",
   "main": "index.js",
   "scripts": {
-    "test": "node --test tests/**/*.test.js"
+    "test": "node --test"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch-logs": "^3.0.0",

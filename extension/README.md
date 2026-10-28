@@ -8,11 +8,11 @@ This sample extension:
 1. Registers the extension with Lambda Extensions API (see `nodejs-example-telemetry-api-extension/extensions-api.js`)
 2. Starts a local HTTP server to receive incoming telemetry events from the Telemetry API (see `nodejs-example-telemetry-api-extension/telemetry-listener.js`)
 3. Subscribes to the Telemetry API to start receiving incoming telemetry events (see `nodejs-example-telemetry-api-extension/telemetry-api.js`)
-4. Receives telemetry events, batches them, and dispatches to a pre-defined URI via POST requests (see `nodejs-example-telemetry-api-extension/telemetry-dispatcher.js`)
+4. Builds Embedded Metric Format (EMF) records from the received telemetry events and writes them to a dedicated CloudWatch Logs log group via the `PutLogEvents` API (see `nodejs-example-telemetry-api-extension/emf-logger.js`)
 
 ![](sample-extension-seq-diagram.png)
 
-Note that Step 4 is asynchronous in nature. The functions is thawed to process the incoming event, and new telemetry might arrive either before or after dispatching existing telemetry. In case of the latter, the newly arrived telemetry will be kept in the telemetry queue and dispatched when processing next event. Depending on buffering configuration you pass to the Telemetry API during subscription, you might get either zero, one, or multiple requests from Telemetry API to the telemetry listener in a single function invocation. 
+The log group destination is controlled by the `METRICS_LOG_GROUP` environment variable, defaulting to `/metrics/lambda-execution-lifecycle`. On the first write the extension creates a log stream in that group, then sends each EMF record with `PutLogEvents`. Depending on buffering configuration you pass to the Telemetry API during subscription, you might get either zero, one, or multiple requests from Telemetry API to the telemetry listener in a single function invocation. 
 
 The code is heavily instrumented with logs so you'll be able to see the Telemetry API extension lifecycle messages as you're learning to implement one. 
 
@@ -25,7 +25,7 @@ There are two major components to this sample:
 
 Install the extension dependencies locally, which will be mounted along with the extension code.
 ```bash
-cd nodejs-example-logs-api-extension
+cd nodejs-example-telemetry-api-extension
 chmod +x index.js
 npm install
 cd ..
@@ -68,6 +68,5 @@ aws lambda update-function-configuration
 
 Configure the extension by setting below environment variables
 
-* `DISPATCH_POST_URI` - the URI you want telemetry to be posted to. If not specified you will still be able to observe extension work via produced logs in CloudWatch, but telemetry events will be discarded. 
-* `DISPATCH_MIN_BATCH_SIZE` - optimize dispatching telemetry by telling the dispatcher how many log events you want it to batch. On function invoke the telemetry will be dispatched to `DISPATCH_POST_URI` only if number of log events collected so far is greater than `DISPATCH_MIN_BATCH_SIZE`. On function shutdown the telemetry will be dispatched to `DISPATCH_POST_URI` regardless of how many log events were collected so far. 
+* `METRICS_LOG_GROUP` - the dedicated CloudWatch Logs log group that EMF records are written to via `PutLogEvents`. If not specified it defaults to `/metrics/lambda-execution-lifecycle`. 
 
