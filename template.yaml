@@ -75,6 +75,10 @@ Resources:
           METRICS_LOG_GROUP: !Ref MetricsLogGroup
       Events:
         HelloApi:
+          # Intentionally public & unauthenticated: this is a demo-only
+          # hello-world endpoint used to generate load for lifecycle telemetry.
+          # No auth by design — see SECURITY.md for the accepted trade-off.
+          # Do NOT copy this pattern to production; add an authorizer/WAF there.
           Type: Api
           Properties:
             Path: /hello

@@ -41,6 +41,9 @@ Resources:
           METRICS_LOG_GROUP: !Ref MetricsLogGroup
       Events:
         HelloWorld:
+          # Intentionally public & unauthenticated: demo-only endpoint to
+          # exercise the telemetry extension. No auth by design — see SECURITY.md.
+          # Not production-safe; add an authorizer before reusing.
           Type: Api
           Properties:
             Path: /hello
